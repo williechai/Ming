@@ -159,9 +159,32 @@ class SD3Loss(torch.nn.Module):
             num_parameters_trainable += p.data.nelement()
         logger.info(f"number of all Diffusion parameters: {num_parameters}, trainable: {num_parameters_trainable}")
 
-        self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                                                        self.scheduler_path, subfolder="scheduler"
-                                                    )
+        self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(self.scheduler_path, subfolder="scheduler")
+        self.pipelines = StableDiffusion3Pipeline(
+            vae=self.vae,
+            transformer=self.train_model,  
+            text_encoder=None, 
+            tokenizer=None,
+            text_encoder_2=None, 
+            tokenizer_2=None, 
+            text_encoder_3=None, 
+            tokenizer_3=None,  
+            scheduler=self.noise_scheduler,
+        ).to(self.device)
+
+        self._compile_pipeline()
+
+    def _compile_pipeline(self):
+        torch._inductor.config.conv_1x1_as_mm = True
+        torch._inductor.config.coordinate_descent_tuning = True
+        torch._inductor.config.epilogue_fusion = False
+        torch._inductor.config.coordinate_descent_check_all_directions = True
+        #self.pipelines.set_progress_bar_config(disable=True)
+        
+        self.pipelines.vae.to(memory_format=torch.channels_last)
+        self.pipelines.vae.decode = torch.compile(self.pipelines.vae.decode, mode="max-autotune", fullgraph=True)
+        self.pipelines.transformer.to(memory_format=torch.channels_last)
+        self.pipelines.transformer = torch.compile(self.pipelines.transformer, mode="max-autotune", fullgraph=True)
         
     def set_trainable_params(self, trainable_params):
         
@@ -192,16 +215,6 @@ class SD3Loss(torch.nn.Module):
         self, encoder_hidden_states, steps=20, cfg=7.0, image_cfg=1.0, cfg_mode=1, seed=42, height=512, width=512, 
         negative_encoder_hidden_states=None, extra_vit_input=None, ref_x=None):
         
-        self.pipelines = StableDiffusion3Pipeline(vae=self.vae,
-                         transformer=self.train_model,  
-                         text_encoder=None, 
-                         tokenizer=None,
-                         text_encoder_2=None, 
-                         tokenizer_2=None, 
-                         text_encoder_3=None, 
-                         tokenizer_3=None,  
-                         scheduler=self.noise_scheduler,
-                         ).to(self.device)
         pooled_projections = torch.nn.functional.adaptive_avg_pool1d(encoder_hidden_states.permute(0, 2, 1), output_size=1)
         pooled_projections = torch.nn.functional.adaptive_avg_pool1d(pooled_projections.squeeze(2), output_size=2048)
         image = self.pipelines(
