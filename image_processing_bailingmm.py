@@ -36,7 +36,7 @@ from transformers.image_utils import (
     ChannelDimension,
     ImageInput,
     PILImageResampling,
-    VideoInput,
+    #VideoInput,
     get_image_size,
     infer_channel_dimension_format,
     is_scaled_image,
@@ -76,7 +76,7 @@ def make_batched_images(images) -> List[List[ImageInput]]:
     raise ValueError(f"Could not make batched images from {images}")
 
 # Copied from transformers.models.llava_next_video.image_processing_llava_next_video.make_batched_videos
-def make_batched_videos(videos) -> List[VideoInput]:
+def make_batched_videos(videos):
     if isinstance(videos, (list, tuple)) and isinstance(videos[0], (list, tuple)) and is_valid_image(videos[0][0]):
         return videos
 
@@ -195,7 +195,7 @@ class BailingMMImageProcessor(BaseImageProcessor):
 
     def _preprocess(
         self,
-        images: Union[ImageInput, VideoInput],
+        images, #: Union[ImageInput, VideoInput],
         do_resize: bool = None,
         resample: PILImageResampling = None,
         do_rescale: bool = None,
@@ -317,7 +317,7 @@ class BailingMMImageProcessor(BaseImageProcessor):
     def preprocess(
         self,
         images: ImageInput,
-        videos: VideoInput = None,
+        videos = None, #: VideoInput = None,
         do_resize: bool = None,
         size: Dict[str, int] = None,
         resample: PILImageResampling = None,

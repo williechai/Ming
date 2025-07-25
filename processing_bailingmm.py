@@ -27,7 +27,7 @@ else:
     from typing_extensions import Unpack
 
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.image_utils import ImageInput, VideoInput
+from transformers.image_utils import ImageInput #, VideoInput
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
@@ -132,7 +132,7 @@ class BailingMMProcessor(ProcessorMixin):
     def __call__(
         self,
         images: ImageInput = None,
-        videos: VideoInput = None,
+        videos = None, #: VideoInput = None,
         audios: Union[Tuple[np.ndarray, torch.Tensor, int], List[Tuple[np.ndarray, torch.Tensor, int]]] = None,
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
         **kwargs,
