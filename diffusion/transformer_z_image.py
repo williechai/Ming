@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Portions of the implementations are adapted from https://github.com/Tongyi-MAI/Z-Image/blob/main/src/zimage/transformer.py. 
-# Based on this code, we made modifications and extensions, including adding Image-Editing functionality, to better support training for Ming-Omni image generation. 
+# Portions of the implementations are adapted from https://github.com/Tongyi-MAI/Z-Image/blob/main/src/zimage/transformer.py.
+# Based on this code, we made modifications and extensions, including adding Image-Editing functionality, to better support training for Ming-Omni image generation.
 # All rights and credit for the original implementation remain with the original authors and contributors, and this project complies with the applicable open-source license terms of the referenced repository.
+
 
 import math
 from typing import List, Optional, Tuple
@@ -330,7 +331,8 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
         rope_theta=256.0,
         t_scale=1000.0,
         axes_dims=[32, 48, 48],
-        axes_lens=[1024, 512, 512],
+        #axes_lens=[1024, 512, 512],
+        axes_lens=[20480, 512, 512],
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -438,6 +440,7 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
         patch_size: int,
         f_patch_size: int,
         all_image_ref: List[torch.Tensor] = None,
+        all_cap_feats_2: List[torch.Tensor] = None,
     ):
         pH = pW = patch_size
         pF = f_patch_size
@@ -450,13 +453,32 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
         all_cap_pos_ids = []
         all_cap_pad_mask = []
         all_cap_feats_out = []
+        all_cap_feats_2_out = []
 
         if all_image_ref is None:
             all_image_ref = [None]*len(all_image)
 
-        for i, (image, cap_feat, image_ref) in enumerate(zip(all_image, all_cap_feats, all_image_ref)):
+        assert all_cap_feats is not None or all_cap_feats_2 is not None
+
+        if all_cap_feats is None:
+            all_cap_feats = [None for _ in range(len(all_image))]
+        else:
+            assert not any([i is None for i in all_cap_feats])
+        
+        if all_cap_feats_2 is None:
+            all_cap_feats_2 = [None for _ in range(len(all_image))]
+        else:
+            assert not any([i is None for i in all_cap_feats_2])
+
+        for i, (image, cap_feat, cap_feat_2, image_ref) in enumerate(zip(all_image, all_cap_feats, all_cap_feats_2, all_image_ref)):
             ### Process Caption
-            cap_ori_len = len(cap_feat)
+            cap_ori_len = 0
+            if cap_feat is not None:
+                cap_ori_len += len(cap_feat)
+            
+            if cap_feat_2 is not None:
+                cap_ori_len += len(cap_feat_2)
+            
             cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
             # padded position ids
             cap_padded_pos_ids = self.create_coordinate_grid(
@@ -477,9 +499,14 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
                 cap_pad_mask if cap_padding_len > 0 else torch.zeros((cap_ori_len,), dtype=torch.bool, device=device)
             )
 
-            # padded feature
-            cap_padded_feat = torch.cat([cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)], dim=0)
-            all_cap_feats_out.append(cap_padded_feat)
+            if cap_feat_2 is not None:
+                if cap_feat is not None:
+                    all_cap_feats_out.append(cap_feat)
+                cap_padded_feat = torch.cat([cap_feat_2, (cap_feat_2[-1:] * 0).repeat(cap_padding_len, 1)], dim=0)
+                all_cap_feats_2_out.append(cap_padded_feat)
+            else:
+                cap_padded_feat = torch.cat([cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)], dim=0)
+                all_cap_feats_out.append(cap_padded_feat)
 
             ### Process Image
             if image_ref is not None:
@@ -539,6 +566,7 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
             all_cap_pos_ids,
             all_image_pad_mask,
             all_cap_pad_mask,
+            all_cap_feats_2_out,
         )
 
     def forward(
@@ -549,6 +577,7 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
         patch_size=2,
         f_patch_size=1,
         ref_x=None,
+        cap_feats_2=None,
         return_dict: bool = True,
     ):
         assert patch_size in self.all_patch_size
@@ -558,7 +587,7 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
         device = x[0].device
         t = t * self.t_scale
         t = self.t_embedder(t)
-
+        
         (
             x,
             cap_feats,
@@ -567,7 +596,8 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
             cap_pos_ids,
             x_inner_pad_mask,
             cap_inner_pad_mask,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size, ref_x)
+            cap_feats_2,
+        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size, ref_x, cap_feats_2)
 
         # x embed & refine
         x_item_seqlens = [len(_) for _ in x]
@@ -599,13 +629,29 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
             for layer in self.noise_refiner:
                 x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
 
-        # cap embed & refine
-        cap_item_seqlens = [len(_) for _ in cap_feats]
-        cap_max_item_seqlen = max(cap_item_seqlens)
 
-        cap_feats = torch.cat(cap_feats, dim=0)
-        cap_feats = self.cap_embedder(cap_feats)
+        if len(cap_feats) > 0:
+            # cap embed & refine
+            cap_item_seqlens = [len(_) for _ in cap_feats]
+            cap_feats = torch.cat(cap_feats, dim=0)
+            cap_feats = self.cap_embedder(cap_feats)
+
+            if len(cap_feats_2) > 0:
+                cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
+                assert len(cap_feats) == len(cap_feats_2)
+                assert cap_feats[0].ndim == 2
+                assert cap_feats_2[0].ndim == 2
+                cap_feats = [torch.cat([i, j], dim=0) for i, j in zip(cap_feats, cap_feats_2)]
+                cap_item_seqlens = [len(_) for _ in cap_feats]
+                cap_feats = torch.cat(cap_feats, dim=0)
+        else:
+            assert len(cap_feats_2) > 0
+            cap_item_seqlens = [len(_) for _ in cap_feats_2]
+            cap_feats = torch.cat(cap_feats_2, dim=0)
+        
+        cap_max_item_seqlen = max(cap_item_seqlens)
         cap_feats[torch.cat(cap_inner_pad_mask)] = self.cap_pad_token
+
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
         cap_freqs_cis = list(
             self.rope_embedder(torch.cat(cap_pos_ids, dim=0)).split([len(_) for _ in cap_pos_ids], dim=0)

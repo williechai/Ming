@@ -11,7 +11,7 @@ import requests
 import torch
 
 from PIL import Image
-import torchaudio
+#import torchaudio
 from typing import Union, Tuple, List
 
 VIDEO_FETCH_VERSION = os.environ.get("VIDEO_FETCH_VERSION", "v1")
@@ -19,13 +19,12 @@ if VIDEO_FETCH_VERSION == "v1":
     from bailingmm_utils_video import v1_fetch_video as fetch_video
 else:
     from bailingmm_utils_video import v2_fetch_video as fetch_video
-from bailingmm_utils_video import VideoInput
 
 logger = logging.getLogger(__name__)
 
-IMAGE_FACTOR = 32
-MIN_PIXELS = 4 * 32 * 32
-MAX_PIXELS = 16384 * 32 * 32
+IMAGE_FACTOR = 28
+MIN_PIXELS = 4 * 28 * 28
+MAX_PIXELS = 1024 * 28 * 28
 MAX_RATIO = 200
 
 VideoInput = Union[
@@ -168,9 +167,10 @@ def fetch_image_wo_resize(ele: dict[str, str | Image.Image], size_factor: int = 
         image_obj = Image.open(image)
     if image_obj is None:
         raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
-    image = image_obj.convert("RGB")
+    
+    #image = image_obj.convert("RGB")
 
-    return image
+    return image_obj
 
 def fetch_audio(ele: dict[str, str | torch.Tensor], return_tensor="pt") -> Tuple[Union[torch.Tensor, np.ndarray], int]:
     if "audio" in ele:
@@ -283,7 +283,7 @@ def process_vision_info(
             else:
                 data_value = [os.path.join(vision_info['video'], frame) for frame in sorted(os.listdir(vision_info['video']))]
             vision_info['video']=data_value
-            return {"video_inputs": [fetch_video(vision_info, return_metadata=True)]}
+            return {"video_inputs": [fetch_video(vision_info)]}
 
         elif "audio" in vision_info or "audio_url" in vision_info:
             if "audio" in vision_info and isinstance(vision_info["audio"], (tuple, list)):
@@ -409,6 +409,19 @@ def process_ratio(ori_h, ori_w, highres=512):
         '3.55': [1248, 352],
         '3.64': [1280, 352],
     }
+    
+    ASPECT_RATIO_2048 = {
+        '0.25': [1024, 4096], '0.26': [1024, 3968], '0.27': [1024, 3840], '0.28': [1024, 3712],
+        '0.32': [1152, 3584], '0.33': [1152, 3456], '0.35': [1152, 3328], '0.4':  [1280, 3200],
+        '0.42': [1280, 3072], '0.48': [1408, 2944], '0.5':  [1408, 2816], '0.52': [1408, 2688],
+        '0.57': [1536, 2688], '0.6':  [1536, 2560], '0.68': [1664, 2432], '0.72': [1664, 2304],
+        '0.78': [1792, 2304], '0.82': [1792, 2176], '0.88': [1920, 2176], '0.94': [1920, 2048],
+        '1.0':  [2048, 2048], '1.07': [2048, 1920], '1.13': [2176, 1920], '1.21': [2176, 1792],
+        '1.29': [2304, 1792], '1.38': [2304, 1664], '1.46': [2432, 1664], '1.67': [2560, 1536],
+        '1.75': [2688, 1536], '2.0':  [2816, 1408], '2.09': [2944, 1408], '2.4':  [3072, 1280],
+        '2.5':  [3200, 1280], '2.89': [3328, 1152], '3.0':  [3456, 1152], '3.11': [3584, 1152],
+        '3.62': [3712, 1024], '3.75': [3840, 1024], '3.88': [3968, 1024], '4.0':  [4096, 1024],
+    }
 
     assert len(ASPECT_RATIO_512) == len(ASPECT_RATIO_1024)
 
@@ -416,6 +429,7 @@ def process_ratio(ori_h, ori_w, highres=512):
         512 : ASPECT_RATIO_512,
         672 : ASPECT_RATIO_672,
         1024 : ASPECT_RATIO_1024,
+        2048 : ASPECT_RATIO_2048,
     }
 
     if highres is None or highres is False:

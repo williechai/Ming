@@ -13,6 +13,7 @@ from IPython import embed
 from PIL import Image
 
 # from modeling_bailing_talker import BailingTalkerForConditionalGeneration
+from diffusers.models.normalization import RMSNorm
 from modeling_whisper_encoder import WhisperAudioEncoder
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
@@ -26,7 +27,7 @@ import torchvision
 from copy import deepcopy
 
 # vision encoder
-from qwen3_moe_vit import Qwen3MoeVisionTransformer
+from qwen2_5_vit import Qwen2_5_VisionTransformer
 
 logger = logging.get_logger(__name__)
 
@@ -56,8 +57,9 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
             return
 
         if self.config.vision_config:
-            self.vision = Qwen3MoeVisionTransformer(self.config.vision_config)
+            self.vision = Qwen2_5_VisionTransformer(self.config.vision_config)
 
+        self.audio = None
         if self.config.audio_config:
             self.audio = WhisperAudioEncoder(**self.config.audio_config.whisper_encoder_config)
 
@@ -93,10 +95,7 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
 
     def extract_image_feature(self, pixel_values, grid_thw):
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            if self.vision.use_deepstack:
-                image_embeds, deepstack_features = self.vision(pixel_values, grid_thw=grid_thw)
-            else:
-                image_embeds = self.vision(pixel_values, grid_thw=grid_thw)
+            image_embeds = self.vision(pixel_values, grid_thw=grid_thw)
         image_embeds = self.linear_proj(image_embeds)
         image_embeds = F.normalize(image_embeds, dim=-1)
         return image_embeds
@@ -130,7 +129,6 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.Tensor]] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: Optional[int] = 0,
         image_gen: Optional[bool] = False,
         image_gen_pixel_values_reference: Optional[torch.FloatTensor] = None,
@@ -146,33 +144,41 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
         image_gen_llm_hidden_states:  Optional[torch.LongTensor] = None,
         image_gen_negative_llm_hidden_states:  Optional[torch.LongTensor] = None,
         image_gen_text: Optional[list] = None,
-        image_gen_highres = 1024,
+        image_gen_highres = 512,
         image_gen_only_extract_hidden_states = False,
         image_gen_condition_embeds=None,
         image_gen_negative_condition_embeds=None,
+        image_gen_condition_embeds_2=None,
+        image_gen_negative_condition_embeds_2=None,
         image_gen_return_batch=False,
         **generate_kwargs,
     ):
         image_embeds, video_embeds, audio_embeds, audio_embeds_lengths = None, None, None, None
 
         if image_gen:
-            if image_gen_condition_embeds is not None:
-                condition_embeds = image_gen_condition_embeds
-                if image_gen_negative_condition_embeds is None:
-                    image_gen_negative_condition_embeds = condition_embeds * 0.0
+            condition_embeds, negative_condition_embeds = None, None
+            condition_embeds_2, negative_condition_embeds_2 = None, None
+            if (image_gen_condition_embeds is not None) or (image_gen_condition_embeds_2 is not None):
+                if image_gen_condition_embeds is not None:
+                    condition_embeds = image_gen_condition_embeds
+                    negative_condition_embeds = condition_embeds * 0.0 if image_gen_negative_condition_embeds is None else image_gen_negative_condition_embeds
                 
-                negative_condition_embeds = image_gen_negative_condition_embeds
+                if image_gen_condition_embeds_2 is not None:
+                    condition_embeds_2 = image_gen_condition_embeds_2
+                    negative_condition_embeds_2 = condition_embeds_2 * 0.0 if image_gen_negative_condition_embeds_2 is None else image_gen_negative_condition_embeds_2
+
             else:
-
-
                 if image_gen_llm_hidden_states is None:
                     assert self.model is not None
                     assert self.vision is not None
                     if pixel_values is not None:
                         image_embeds = self.extract_image_feature(pixel_values, grid_thw=image_grid_thw)
+                
                 assert self.loaded_image_gen_modules is True, "please add `load_image_gen=True` in from_pretrained() method"
                 assert position_ids is None
-                condition_embeds = self.get_condition_embeds_for_image_gen(
+
+                
+                condition_embeds, condition_embeds_2 = self.get_condition_embeds_for_image_gen(
                     input_ids=input_ids, 
                     attention_mask=attention_mask,
                     image_embeds=image_embeds, 
@@ -181,80 +187,95 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
                     image_grid_thw=image_grid_thw,
                     llm_hidden_states=image_gen_llm_hidden_states,
                 )
-                negative_condition_embeds = self.get_condition_embeds_for_image_gen(
-                    input_ids=image_gen_negative_input_ids, 
-                    attention_mask=image_gen_negative_attention_mask,
-                    image_embeds=image_embeds, 
-                    position_ids=position_ids,
-                    use_cache=use_cache,
-                    image_grid_thw=image_grid_thw,
-                    llm_hidden_states=image_gen_negative_llm_hidden_states,
-                ) if ((image_gen_negative_input_ids is not None) or (image_gen_negative_llm_hidden_states is not None)) else condition_embeds * 0.0
+                if condition_embeds is not None:
+                    negative_condition_embeds = condition_embeds * 0.0
+                
+                if condition_embeds_2 is not None:
+                    negative_condition_embeds_2 = condition_embeds_2 * 0.0
 
+                # 负向提示词功能已经废弃
+                # negative_condition_embeds = self.get_learnable_token_embeds_for_image_gen(
+                #     input_ids=image_gen_negative_input_ids, 
+                #     attention_mask=image_gen_negative_attention_mask,
+                #     image_embeds=image_embeds, 
+                #     position_ids=position_ids,
+                #     use_cache=use_cache,
+                #     image_grid_thw=image_grid_thw,
+                #     llm_hidden_states=image_gen_negative_llm_hidden_states,
+                # ) if ((image_gen_negative_input_ids is not None) or (image_gen_negative_llm_hidden_states is not None)) else condition_embeds * 0.0
 
-                using_byt5 = False if image_gen_text is None else any([len(i) > 0 for i in image_gen_text]) 
-                byt5_prompt_embeds = None
-                if self.byt5_model is not None and using_byt5:
-                    byt5_text_inputs = self.byt5_tokenizer(
-                        image_gen_text,
-                        padding="max_length",
-                        max_length=self.byt5_config.byt5_max_length,
-                        truncation=True,
-                        add_special_tokens=True,
-                        return_tensors="pt",
-                    )
-                    byt5_text_input_ids = byt5_text_inputs.input_ids
-                    text_attn_mask = None
-                    byt5_attention_mask = (
-                        byt5_text_inputs.attention_mask.to(condition_embeds.device) 
-                        if text_attn_mask is None else 
-                        text_attn_mask.to(
-                            condition_embeds.device, 
-                            dtype=byt5_text_inputs.attention_mask.dtype
+                if self.byt5_model:
+                    using_byt5 = False if image_gen_text is None else any([len(i) > 0 for i in image_gen_text]) 
+                    byt5_prompt_embeds = None
+                    if self.byt5_model is not None and using_byt5:
+                        byt5_text_inputs = self.byt5_tokenizer(
+                            image_gen_text,
+                            padding="max_length",
+                            max_length=self.byt5_config.byt5_max_length,
+                            truncation=True,
+                            add_special_tokens=True,
+                            return_tensors="pt",
                         )
-                    )
-                    # print(byt5_attention_mask)
-                    # with torch.cuda.amp.autocast(enabled=False):
-                    byt5_prompt_embeds = self.byt5_model(
-                        byt5_text_input_ids.to(condition_embeds.device),
-                        attention_mask=byt5_attention_mask.float(),
-                    )
-                    
-                    byt5_prompt_embeds = byt5_prompt_embeds[0]
-                    byt5_prompt_embeds = self.byt5_mapper(byt5_prompt_embeds, byt5_attention_mask)
-                    byt5_prompt_embeds = byt5_prompt_embeds * byt5_attention_mask.unsqueeze(-1)
+                        byt5_text_input_ids = byt5_text_inputs.input_ids
+                        text_attn_mask = None
+                        byt5_attention_mask = (
+                            byt5_text_inputs.attention_mask.to(condition_embeds.device) 
+                            if text_attn_mask is None else 
+                            text_attn_mask.to(
+                                condition_embeds.device, 
+                                dtype=byt5_text_inputs.attention_mask.dtype
+                            )
+                        )
+                        # print(byt5_attention_mask)
+                        # with torch.cuda.amp.autocast(enabled=False):
+                        byt5_prompt_embeds = self.byt5_model(
+                            byt5_text_input_ids.to(condition_embeds.device),
+                            attention_mask=byt5_attention_mask.float(),
+                        )
+                        
+                        byt5_prompt_embeds = byt5_prompt_embeds[0]
+                        byt5_prompt_embeds = self.byt5_mapper(byt5_prompt_embeds, byt5_attention_mask)
+                        byt5_prompt_embeds = byt5_prompt_embeds * byt5_attention_mask.unsqueeze(-1)
 
-                if byt5_prompt_embeds is not None:
-                    condition_embeds = torch.cat((condition_embeds, byt5_prompt_embeds), dim=1)
-                    negative_condition_embeds = torch.cat((negative_condition_embeds, byt5_prompt_embeds * 0.0), dim=1)
+                    if byt5_prompt_embeds is not None:
+                        condition_embeds = torch.cat((condition_embeds, byt5_prompt_embeds), dim=1)
+                        negative_condition_embeds = torch.cat((negative_condition_embeds, byt5_prompt_embeds * 0.0), dim=1)
+
+            
 
                 if image_gen_only_extract_hidden_states:
-                    return condition_embeds, negative_condition_embeds
+                    return condition_embeds, negative_condition_embeds, condition_embeds_2, negative_condition_embeds_2
+            
+            assert (condition_embeds is not None) or (condition_embeds_2 is not None)
+            if (condition_embeds is not None) and (condition_embeds_2 is not None):
+                assert condition_embeds.shape[0] == condition_embeds_2.shape[0]
+
+            bsz = condition_embeds.shape[0] if condition_embeds is not None else condition_embeds_2.shape[0]
 
             if image_gen_height is None or image_gen_width is None:
                 if isinstance(image_gen_highres, int):
-                    image_gen_height, image_gen_width = [image_gen_highres] * condition_embeds.shape[0], [image_gen_highres] * condition_embeds.shape[0]
+                    image_gen_height, image_gen_width = [image_gen_highres] * bsz, [image_gen_highres] * bsz
                 elif image_gen_highres is True:
-                    image_gen_height, image_gen_width = [1024] * condition_embeds.shape[0], [1024] * condition_embeds.shape[0]
+                    image_gen_height, image_gen_width = [1024] * bsz, [1024] * bsz
                 else:
-                    image_gen_height, image_gen_width = [512] * condition_embeds.shape[0], [512] * condition_embeds.shape[0]
+                    image_gen_height, image_gen_width = [512] * bsz, [512] * bsz
             elif isinstance(image_gen_height, torch.Tensor) or isinstance(image_gen_width, torch.Tensor):
                 assert isinstance(image_gen_height, torch.Tensor), image_gen_height
                 assert isinstance(image_gen_width, torch.Tensor), image_gen_width
                 image_gen_height = image_gen_height.cpu().tolist()
                 image_gen_width = image_gen_width.cpu().tolist()
-                assert len(image_gen_height) == condition_embeds.shape[0]
-                assert len(image_gen_width)  == condition_embeds.shape[0]
+                assert len(image_gen_height) == bsz
+                assert len(image_gen_width)  == bsz
             elif isinstance(image_gen_height, int) or isinstance(image_gen_width, int):
                 assert isinstance(image_gen_height, int), image_gen_height
                 assert isinstance(image_gen_width, int), image_gen_width
-                image_gen_height = [image_gen_height] * condition_embeds.shape[0]
-                image_gen_width = [image_gen_width] * condition_embeds.shape[0]
+                image_gen_height = [image_gen_height] * bsz
+                image_gen_width = [image_gen_width] * bsz
             else:
                 assert isinstance(image_gen_height, list), image_gen_height
                 assert isinstance(image_gen_width, list), image_gen_width
-                assert len(image_gen_height) == condition_embeds.shape[0]
-                assert len(image_gen_width)  == condition_embeds.shape[0]
+                assert len(image_gen_height) == bsz
+                assert len(image_gen_width)  == bsz
 
 
             image_gen_height_diffusion_list = []
@@ -283,18 +304,24 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
                 image_gen_seed = datetime.now().microsecond % 1000
                 
             sample_kwargs = {
-                "encoder_hidden_states": condition_embeds,
                 "steps": image_gen_steps,
                 "seed": image_gen_seed,
                 "cfg": image_gen_cfg,
                 "height": image_gen_height,
                 "width": image_gen_width,
-                "negative_encoder_hidden_states": negative_condition_embeds,
                 "image_cfg": image_gen_image_cfg,
                 "cfg_mode": image_gen_cfg_mode,
                 "ref_x": image_gen_pixel_values_reference,
+                "encoder_hidden_states": condition_embeds,
+                "directvlm_hidden_states": condition_embeds_2,
             }
-            print("encoder_hidden_states.shape: ", condition_embeds.shape)
+
+            if condition_embeds is not None:
+                print("encoder_hidden_states.shape: ", condition_embeds.shape)
+            
+            if condition_embeds_2 is not None:
+                print("directvlm_hidden_states.shape: ", condition_embeds_2.shape)
+
             print("image_gen_seed: ", image_gen_seed)
             print("image_gen_cfg: ", image_gen_cfg)
             print("image_gen_image_cfg: ", image_gen_image_cfg)
@@ -302,7 +329,6 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
             print("image_gen_height: ", image_gen_height)
             print("image_gen_width: ", image_gen_width)
             print("image_gen_text: ", image_gen_text)
-            print("condition_embeds.shape: ", condition_embeds.shape)
             print("image_gen_output_resize_height: ", image_gen_output_resize_height)
             print("image_gen_output_resize_width: ", image_gen_output_resize_width)
               
@@ -337,7 +363,6 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                cache_position=cache_position,
                 use_cache=use_cache,
                 num_logits_to_keep=num_logits_to_keep,
                 **generate_kwargs,
@@ -428,7 +453,6 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
             device = torch.device(device)
         else:
             device = torch.device(torch.cuda.current_device())
-
         print("load_image_gen_modules", device)
         from transformers import AutoModelForCausalLM
         import os
@@ -445,17 +469,24 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
             )
             with safe_open(safetensors_path, framework="pt") as f:
                 temp_state_dict = {key: f.get_tensor(key) for key in f.keys()}
-
         with open(os.path.join(inference_model_path, 'mlp', 'config.json'), 'r') as f:
             import json
             metax_config = json.load(f)
             diffusion_c_input_dim = metax_config["diffusion_c_input_dim"] if "diffusion_c_input_dim" in metax_config else 2048
-            img_gen_scales = metax_config["img_gen_scales"] if "img_gen_scales" in metax_config else [4, 8, 16]
+            self.img_gen_scales = metax_config["img_gen_scales"] if "img_gen_scales" in metax_config else [4, 8, 16]
             dit_type = metax_config["dit_type"] if "dit_type" in metax_config else "sd3"
+            self.connector_norm = metax_config["connector_norm"] if "connector_norm" in metax_config else True,
+            self.use_vlm_directvlm_condition = metax_config["use_vlm_directvlm_condition"] if "use_vlm_directvlm_condition" in metax_config else False
+            self.use_learnable_token_condition = metax_config["use_learnable_token_condition"] if "use_learnable_token_condition" in metax_config else True
+            self.selected_hidden_states_layers = metax_config["selected_hidden_states_layers"] if "selected_hidden_states_layers" in metax_config else None
+            self.diffusion_inner_dim = metax_config["diffusion_inner_dim"] if "diffusion_inner_dim" in metax_config else None
 
         if load_image_gen_others:
+            self.connector = None    
             self.query_tokens_dict = nn.ParameterDict()
-            self.img_gen_scales = img_gen_scales
+            # 计算各尺度的累积索引
+            self.scale_indices = []
+            current_idx = 0
             for scale in self.img_gen_scales:                    
                 num_tokens = scale * scale
                 scale_name = f"{scale}x{scale}"
@@ -463,44 +494,64 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
                 self.query_tokens_dict[scale_name] = nn.Parameter(
                     torch.nn.functional.normalize(torch.randn(num_tokens, self.config.llm_config.hidden_size), dim=-1)
                 )
-            self.query_tokens_dict.to(torch_dtype).to(device)
-            modified_state_dict_query_tokens = {
-                f"{scale}x{scale}": temp_state_dict[f"query_tokens_dict.{scale}x{scale}"]
-                for scale in self.img_gen_scales   
-            }
-            self.query_tokens_dict.load_state_dict(modified_state_dict_query_tokens, strict=True)
-            # 计算各尺度的累积索引
-            self.scale_indices = []
-            current_idx = 0
-            for scale in self.img_gen_scales:
                 current_idx += scale * scale
                 self.scale_indices.append(current_idx)
-            
-            #self.norm_query_embeds = True
-            # load connector
-            self.connector = AutoModelForCausalLM.from_pretrained(inference_model_path, subfolder='connector', torch_dtype=torch_dtype)
-            for layer in self.connector.model.layers:
-                layer.self_attn.is_causal = False
-            self.connector.to(device)
-            
-            
-            self.proj_in = nn.Linear(self.config.llm_config.hidden_size, self.connector.config.hidden_size)
-            self.proj_out = nn.Linear(self.connector.config.hidden_size, diffusion_c_input_dim)
-            
-            modified_state_dict_in = {
-                'weight': temp_state_dict['proj_in.weight'],
-                'bias': temp_state_dict['proj_in.bias']
-            }
-            self.proj_in.load_state_dict(modified_state_dict_in, strict=True)
-            modified_state_dict_out = {
-                'weight': temp_state_dict['proj_out.weight'],
-                'bias': temp_state_dict['proj_out.bias']
-            }
-            self.proj_out.load_state_dict(modified_state_dict_out, strict=True)
-            self.proj_in.to(device)
-            self.proj_out.to(device)
 
-            self.load_byt5(os.path.join(inference_model_path, "byt5"), torch_dtype=torch_dtype, device=device)
+            self.query_tokens_dict.to(torch_dtype).to(device)
+
+            if self.use_learnable_token_condition:
+                modified_state_dict_query_tokens = {
+                    f"{scale}x{scale}": temp_state_dict[f"query_tokens_dict.{scale}x{scale}"]
+                    for scale in self.img_gen_scales   
+                }
+            
+                self.query_tokens_dict.load_state_dict(modified_state_dict_query_tokens, strict=True)
+                
+                # self.norm_query_embeds = True
+                # load connector
+                self.connector = AutoModelForCausalLM.from_pretrained(inference_model_path, subfolder='connector', torch_dtype=torch_dtype)
+                for layer in self.connector.model.layers:
+                    layer.self_attn.is_causal = False
+                self.connector.to(device)
+                
+                
+                self.proj_in = nn.Linear(self.config.llm_config.hidden_size, self.connector.config.hidden_size)
+                self.proj_out = nn.Linear(self.connector.config.hidden_size, diffusion_c_input_dim)
+                
+                modified_state_dict_in = {
+                    'weight': temp_state_dict['proj_in.weight'],
+                    'bias': temp_state_dict['proj_in.bias']
+                }
+                self.proj_in.load_state_dict(modified_state_dict_in, strict=True)
+                modified_state_dict_out = {
+                    'weight': temp_state_dict['proj_out.weight'],
+                    'bias': temp_state_dict['proj_out.bias']
+                }
+                self.proj_out.load_state_dict(modified_state_dict_out, strict=True)
+                self.proj_in.to(device)
+                self.proj_out.to(device)
+
+            self.proj_directvlm = None
+            if self.use_vlm_directvlm_condition:
+                directvlm_dim = self.model.config.hidden_size
+                if self.selected_hidden_states_layers is not None:
+                    directvlm_dim = directvlm_dim * len(self.selected_hidden_states_layers)
+
+                self.proj_directvlm = nn.Sequential(RMSNorm(directvlm_dim, eps=1e-5), nn.Linear(directvlm_dim, self.diffusion_inner_dim, bias=True))
+                
+                modified_state_dict_directvlm = {
+                    '0.weight': temp_state_dict["proj_directvlm.0.weight"],
+                    '1.weight': temp_state_dict["proj_directvlm.1.weight"],
+                    '1.bias': temp_state_dict["proj_directvlm.1.bias"],
+                }
+                self.proj_directvlm.load_state_dict(modified_state_dict_directvlm, strict=True)
+                self.proj_directvlm.to(device)
+
+            if os.path.exists(os.path.join(inference_model_path, "byt5")):
+                self.load_byt5(os.path.join(inference_model_path, "byt5"), torch_dtype=torch_dtype, device=device)
+            else:
+                self.byt5_model = None
+                print("Skip byt5_model")
 
         if load_image_gen_diffusion:
             diffusion_mlp_state_dict = {
@@ -545,9 +596,7 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
                 raise ValueError("unsupported dit type: {}".format(dit_type))
             self.diffusion_loss.to(device)
             print("diffusion_loss device", self.diffusion_loss.device, device)
-
         self.loaded_image_gen_modules = True
-
     @classmethod
     def from_pretrained(
         cls,
@@ -559,7 +608,6 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
         if "load_image_gen" in kwargs:
             load_image_gen = kwargs["load_image_gen"]
             del kwargs["load_image_gen"]
-
         load_image_gen_diffusion = True
         if "load_image_gen_diffusion" in kwargs:
             load_image_gen_diffusion = kwargs["load_image_gen_diffusion"]
@@ -569,7 +617,6 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
         if "load_image_gen_others" in kwargs:
             load_image_gen_others = kwargs["load_image_gen_others"]
             del kwargs["load_image_gen_others"]
-
         load_vlm = True
         if "load_vlm" in kwargs:
             load_vlm = kwargs["load_vlm"]
@@ -632,6 +679,7 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
         new_text_ids_list = []
         new_attention_mask_list = []
         gen_mask_list = []
+        new_labels_list = []
         for text_ids_one_batch, attention_mask_one_batch in zip(
             text_ids_list, attention_mask_list
         ):
@@ -645,6 +693,8 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
                 padding_start += 1
 
             new_text_ids_list.append(text_ids_one_batch[:padding_start] + deepcopy(default_scaled_tokens) + text_ids_one_batch[padding_start:])
+            new_labels_list.append([ -100 for _ in range(padding_start)] + [1 for _ in range(len(default_scaled_tokens))] + [-100 for _ in range(len(text_ids_one_batch[padding_start:]))] )
+
             new_attention_mask_list.append(attention_mask_one_batch[:padding_start] + deepcopy(default_scaled_attn_masks) + attention_mask_one_batch[padding_start:])
             gen_mask_list.append(
                 [0 for _ in range(len(attention_mask_one_batch[:padding_start]))] + \
@@ -655,10 +705,12 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
         text_ids_append_lq = torch.tensor(new_text_ids_list, dtype=text_ids.dtype).to(text_ids.device)
         attention_mask_append_lq = torch.tensor(new_attention_mask_list, dtype=attention_mask.dtype).to(attention_mask.device)
         gen_mask = torch.tensor(gen_mask_list, dtype=attention_mask.dtype).to(attention_mask.device)
+        labels = torch.tensor(new_labels_list, dtype=text_ids.dtype).to(text_ids.device)
 
         assert attention_mask_append_lq.shape == text_ids_append_lq.shape
+        assert labels.shape == text_ids_append_lq.shape
         assert gen_mask.shape == text_ids_append_lq.shape
-        return text_ids_append_lq, attention_mask_append_lq, gen_mask
+        return text_ids_append_lq, labels, attention_mask_append_lq, gen_mask
 
     def appand_learnable_tokens(
         self,
@@ -751,7 +803,7 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
         image_grid_thw,
         llm_hidden_states,
     ):
-        input_ids, attention_mask, gen_mask = self.append_input_ids_with_multiscale_learnable_tokens(
+        input_ids, labels, attention_mask, gen_mask = self.append_input_ids_with_multiscale_learnable_tokens(
             input_ids,
             attention_mask,
             self.img_gen_scales,
@@ -759,7 +811,6 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
             self.config.llm_config.image_patch_token + 2,
             self.config.llm_config.image_patch_token,
         )
-
         
         if llm_hidden_states is None:
             image_grid_thw, image_embeds = self.appand_learnable_tokens(
@@ -807,32 +858,56 @@ class BailingMM2NativeForConditionalGeneration(PreTrainedModel):
         else:
             hidden_states = llm_hidden_states
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            gen_mask = gen_mask.unsqueeze(-1).expand(gen_mask.shape[0], gen_mask.shape[1], hidden_states.shape[-1]).to(hidden_states.device).bool()
-            hidden_states_gen = torch.masked_select(hidden_states, gen_mask).view(hidden_states.shape[0], -1, hidden_states.shape[-1])
-            # 分解hidden_states为不同尺度的表示
-            scale_start_idxes = [0] + self.scale_indices[:-1]
-            scale_end_idxes = self.scale_indices
-            assert scale_end_idxes[-1] == hidden_states_gen.shape[1]
+        directvlm_hidden_states = None
+        if self.use_vlm_directvlm_condition:
+            # use hidden states
+            use_input_mask = torch.lt(labels, 0).int().to(attention_mask.dtype) * attention_mask
+            assert use_input_mask.ndim == 2
+            directvlm_max_valid_ind = use_input_mask.cumsum(-1).argmax(-1).max().item() + 1
+            #directvlm_max_valid_ind = min(directvlm_max_valid_ind, self.max_vlm_directvlm_length)
+            use_input_mask = use_input_mask[:, :directvlm_max_valid_ind]
+
+            if self.selected_hidden_states_layers is not None:
+                directvlm_hidden_states = torch.cat([
+                    outputs.hidden_states[layer_i].to(labels.device)[:, :directvlm_max_valid_ind, :] * use_input_mask.unsqueeze(-1)
+                    for layer_i in self.selected_hidden_states_layers
+                ], dim=-1)
+            else:
+                directvlm_hidden_states = outputs.hidden_states[-1].to(labels.device)[:, :directvlm_max_valid_ind, :] * use_input_mask.unsqueeze(-1)
             
-            scale, scale_start_idx, scale_end_idx = [
-                i for i in zip(self.img_gen_scales, scale_start_idxes, scale_end_idxes)
-            ][-1]
-            
-            scale_hidden = hidden_states_gen[:, scale_start_idx : scale_end_idx, :]
-            scale_embeds = self.proj_in(scale_hidden)
-            seq_shape = scale_embeds.shape
+            directvlm_hidden_states = directvlm_hidden_states.detach()
+            directvlm_hidden_states = self.proj_directvlm(directvlm_hidden_states)
+
+        scale_embeds = None
+        if self.use_learnable_token_condition:
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                scale_embeds = self.connector(
-                    inputs_embeds=scale_embeds, 
-                    attention_mask=torch.ones(seq_shape[0],1,seq_shape[1],seq_shape[1]).to(scale_embeds.device), 
-                    output_hidden_states=True
-                ).hidden_states[-1]
+                gen_mask = gen_mask.unsqueeze(-1).expand(gen_mask.shape[0], gen_mask.shape[1], hidden_states.shape[-1]).to(hidden_states.device).bool()
+                hidden_states_gen = torch.masked_select(hidden_states, gen_mask).view(hidden_states.shape[0], -1, hidden_states.shape[-1])
+                # 分解hidden_states为不同尺度的表示
+                scale_start_idxes = [0] + self.scale_indices[:-1]
+                scale_end_idxes = self.scale_indices
+                assert scale_end_idxes[-1] == hidden_states_gen.shape[1]
                 
-            scale_embeds = self.proj_out(scale_embeds)
-            # 归一化
-            scale_embeds = torch.nn.functional.normalize(scale_embeds, dim=-1)
-            return scale_embeds
+                scale, scale_start_idx, scale_end_idx = [
+                    i for i in zip(self.img_gen_scales, scale_start_idxes, scale_end_idxes)
+                ][-1]
+                
+                scale_hidden = hidden_states_gen[:, scale_start_idx : scale_end_idx, :]
+                scale_embeds = self.proj_in(scale_hidden)
+                seq_shape = scale_embeds.shape
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    scale_embeds = self.connector(
+                        inputs_embeds=scale_embeds, 
+                        attention_mask=torch.ones(seq_shape[0],1,seq_shape[1],seq_shape[1]).to(scale_embeds.device), 
+                        output_hidden_states=True
+                    ).hidden_states[-1]
+                    
+                scale_embeds = self.proj_out(scale_embeds)
+                # 归一化
+                if self.connector_norm:
+                    scale_embeds = torch.nn.functional.normalize(scale_embeds, dim=-1)
+
+        return scale_embeds, directvlm_hidden_states
 
 __all__ = [
     "BailingMM2NativeForConditionalGeneration"

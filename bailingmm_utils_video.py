@@ -99,14 +99,15 @@ def _read_video_torchcodec(
         source=video_path,
         dimension_order="NHWC",
         num_ffmpeg_threads=0,
-        seek_mode="exact",
+        seek_mode="approximate",
         device="cuda" if use_cuda else "cpu",
     )
+    # print(decoder.metadata)
     src_frames = decoder.metadata.num_frames
     src_fps = src_frames / decoder.metadata.duration_seconds
-    if src_fps < 1.0 or src_fps > 240.0:
+    if src_fps < 1.0 or src_fps > 120.0:
         print(f"warning: abnormal {src_fps=}")
-        src_fps = min(max(src_fps, 1.0), 240.0)
+        src_fps = min(max(src_fps, 1.0), 120.0)
 
     if sampler is None:
         smp_frames = src_frames
@@ -192,9 +193,7 @@ def load_video(video_path: str, sampler: Optional[Callable] = None) -> Tuple[tor
             video, smp_fps = VIDEO_READER_BACKENDS[video_reader_backend](video_path, sampler=sampler)
         except Exception as e:
             logger.warning(f"[{video_reader_backend}] error, fall back to torchvision: {e}")
-            video, smp_fps = VIDEO_READER_BACKENDS["torchvision"](
-                video_path, sampler=sampler
-            )
+            video, smp_fps = VIDEO_READER_BACKENDS["torchvision"](video_path, sampler=sampler)
         logger.info(f"[{video_reader_backend}] {video_path=}, {smp_fps=}, duration={time.time() - st:.3f}s")
     else:
         raise NotImplementedError("only support video path str input for now.")
@@ -205,19 +204,19 @@ def load_video(video_path: str, sampler: Optional[Callable] = None) -> Tuple[tor
 ########
 # V1 parameters
 
-IMAGE_FACTOR = 32
-MIN_PIXELS = 4 * 32 * 32
-MAX_PIXELS = 16384 * 32 * 32
+IMAGE_FACTOR = 28
+MIN_PIXELS = 4 * 28 * 28
+MAX_PIXELS = 1024 * 28 * 28
 MAX_RATIO = 200
 
-VIDEO_MIN_PIXELS = 128 * 32 * 32
-VIDEO_MAX_PIXELS = 768 * 32 * 32  # 4: 3 => 32: 24 (768) | 16:9 => 32:18 (576)
-VIDEO_TOTAL_PIXELS = 96 * 128 * 32 * 32  # 9216: 24-72 frames | 7680: 10-60 frames | 6144: 8-48 frames
+VIDEO_MIN_PIXELS = 128 * 28 * 28
+VIDEO_MAX_PIXELS = 768 * 28 * 28  # 4: 3 => 32: 24 (768) | 16:9 => 32:18 (576)
+VIDEO_TOTAL_PIXELS = 96 * 128 * 28 * 28  # 9216: 24-72 frames | 7680: 10-60 frames | 6144: 8-48 frames
 
 FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
-FPS_MAX_FRAMES = 256
+FPS_MAX_FRAMES = 128
 
 VideoInput = Union[
     List["Image.Image"],
@@ -233,7 +232,7 @@ VideoInput = Union[
 ########
 # V1 sample
 
-def v1_sample_frames(num_frames, total_frames, sample="sequence"):
+def v1_sample_frames(num_frames, total_frames, sample="random"):
     if sample == "sequence":
         frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
     else:
@@ -262,51 +261,37 @@ def v1_sample_frames(num_frames, total_frames, sample="sequence"):
             raise NotImplementedError
     return frame_indices
 
-def v1_smart_nframes(
+def v1_get_frames(
     ele: dict,
     total_frames: int,
-    video_fps: Union[int, float],
 ) -> int:
     """calculate the number of frames for video used for model inputs.
-
-    Args:
+        Args:
         ele (dict): a dict contains the configuration of video.
-            support either `fps` or `nframes`:
-                - nframes: the number of frames to extract for model inputs.
-                - fps: the fps to extract frames for model inputs.
-                    - min_frames: the minimum number of frames of the video, only used when fps is provided.
-                    - max_frames: the maximum number of frames of the video, only used when fps is provided.
         total_frames (int): the original total number of frames of the video.
-        video_fps (int | float): the original fps of the video.
-
-    Raises:
-        ValueError: nframes should in interval [FRAME_FACTOR, total_frames].
-
     Returns:
         int: the number of frames for video used for model inputs.
     """
-    assert not ("fps" in ele and "nframes" in ele), "Only accept either `fps` or `nframes`"
-    
-    min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
-    max_frames = floor_by_factor(ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), FRAME_FACTOR)
-
     if "nframes" in ele:
-        nframes = min(total_frames, round_by_factor(ele["nframes"], FRAME_FACTOR), max_frames)
+        num_frames = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:
-        fps = ele.get("max_video_fps", FPS)
-        nframes = total_frames / video_fps * fps
-        if nframes > total_frames:
-            logger.warning(f"smart_nframes: nframes[{nframes}] > total_frames[{total_frames}]")
-        nframes = min(min(max(nframes, min_frames), max_frames), total_frames)
-        nframes = floor_by_factor(nframes, FRAME_FACTOR)
-    if not (FRAME_FACTOR <= nframes <= total_frames):
-        raise ValueError(f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}.")
-    return nframes
+        min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
+        max_frames = floor_by_factor(ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), FRAME_FACTOR)
+        num_frames = max(min(total_frames, max_frames), min_frames)
+        num_frames = floor_by_factor(num_frames, FRAME_FACTOR)
 
+    if not (FRAME_FACTOR <= num_frames <= total_frames):
+        raise ValueError(f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {num_frames}.")
+    return num_frames
 
 def v1_sample_video(video_fps, total_frames, ele: dict) -> List[int]:
     sample_method = ele.get("sample", "sequence")
-    num_frames = v1_smart_nframes(ele, total_frames, video_fps)
+    max_video_fps = ele.get("max_video_fps", 2.0)
+
+    if video_fps > max_video_fps and total_frames / float(video_fps) > 4.0:
+        num_frames = v1_get_frames(ele, int(total_frames / float(video_fps) * max_video_fps))
+    else:
+        num_frames = v1_get_frames(ele, total_frames)
     frame_indices = v1_sample_frames(
         num_frames=num_frames, total_frames=total_frames, sample=sample_method
     )
@@ -360,14 +345,10 @@ def smart_resize(
 # V1 fetch video
 
 def v1_fetch_video(
-    ele: dict,
-    image_factor: int = IMAGE_FACTOR,
-    return_video_sample_fps: bool = False,
-    return_video_timestamp: bool = False,
-    return_metadata: bool = False,
-) -> torch.Tensor | list[Image.Image]:
+        ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False
+        ) -> torch.Tensor | list[Image.Image]:
     if isinstance(ele["video"], str):
-        video, smp_fps = load_video(ele["video"], sampler=v2_sample_video)
+        video, smp_fps = load_video(ele["video"], sampler=partial(v1_sample_video, ele=ele))
 
         if "resized_height" in ele and "resized_width" in ele:
             resized_height, resized_width = smart_resize(
@@ -379,6 +360,7 @@ def v1_fetch_video(
             num_frames, height, width, channels = video.shape
             min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
             total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
+            # max_pixels = max(min(VIDEO_MAX_PIXELS, total_pixels / num_frames * FRAME_FACTOR), int(min_pixels * 1.05))
             max_pixels = max(total_pixels / num_frames * FRAME_FACTOR, int(min_pixels * 1.05))
 
             resized_height, resized_width = smart_resize(
@@ -400,7 +382,7 @@ def v1_fetch_video(
             for video_element in ele["video"]
         ]
 
-        num_frames = v1_smart_nframes(ele, total_frames, video_fps=2.0)
+        num_frames = v1_get_frames(ele, total_frames)
         frame_indices = v1_sample_frames(
             num_frames=num_frames, total_frames=total_frames, sample=sample_method
         )
@@ -445,43 +427,23 @@ def v1_fetch_video(
                 video[idx] = torch.from_numpy(arr)
 
         video = torch.stack(video, dim=0)
-
     logger.info(f"video-in: num_frames={video.shape[0]}, {resized_height=}, {resized_width=}")
     video = batched_resize(video, resized_width, resized_height, method=1, interp='bicubic', channel_first=False)
     video = video.permute(0, 3, 1, 2)
 
-    resmp_fps = smp_fps
-    resmp_ts = np.array([i / smp_fps for i in range(video.shape[0])])
-
-    num_pad_frames = FRAME_FACTOR - (len(video) % FRAME_FACTOR)
-    if num_pad_frames < FRAME_FACTOR:
-        video = torch.cat([video] + [video[-1:]] * num_pad_frames, dim=0)
-        resmp_ts = np.concatenate(
-            [resmp_ts, np.array([resmp_ts[-1] * num_pad_frames])],
-        )
-
-    if return_metadata:
-        metadata = {
-            "resmp_ts": resmp_ts,
-            "resmp_fps": resmp_fps,
-        }
-        return video, metadata
-    if return_video_timestamp:
-        return video, resmp_ts
     if return_video_sample_fps:
-        return video, resmp_fps
+        return video, smp_fps
     return video
-
 
 ########
 # V2 parameters
 
-IMAGE_FACTOR = 16 * 2
-FRAME_FACTOR = int(os.environ.get('FRAME_FACTOR', 2))
+IMAGE_FACTOR = 14 * 2
+FRAME_FACTOR = 2
 MAX_FPS = float(os.environ.get('MAX_FPS', 2.0))
 MIN_PATCHES_PER_FRAME = int(os.environ.get('MIN_PATCHES_PER_FRAME', 144))
-MAX_PATCHES_PER_FRAME = int(os.environ.get('MAX_PATCHES_PER_FRAME', 3072))
-MAX_TOKENS = int(os.environ.get('MAX_TOKENS', 3072))
+MAX_PATCHES_PER_FRAME = int(os.environ.get('MAX_PATCHES_PER_FRAME', 1125))
+MAX_TOKENS = int(os.environ.get('MAX_TOKENS', 3000))
 MAX_PATCHES = MAX_TOKENS * FRAME_FACTOR
 MAX_PATCHES_OS = MAX_PATCHES * int(os.environ.get('MAX_PATCHES_OS_MULTIPLIER', 4))
 MAX_FRAMES_OS = MAX_PATCHES_OS // MIN_PATCHES_PER_FRAME
@@ -490,7 +452,7 @@ SUBSAMPLE_PIXELS = 16384
 SAD_MEAN_ANCHOR = SUBSAMPLE_PIXELS * int(os.environ.get('SAD_MEAN_ANCHOR_MULTIPLIER', 20))
 SAD_SUM_RATIO_SCALE = 1.0
 SAD_SUM_RATIO_OFFSET = 0.0
-MAX_SAMPLE_INTERVAL = float(os.environ.get('MAX_SAMPLE_INTERVAL', 4.0))
+MAX_SAMPLE_INTERVAL = float(os.environ.get('MAX_SAMPLE_INTERVAL', 1.0))
 
 ########
 # V2 sample
@@ -509,7 +471,7 @@ def v2_sample_video(
     """
     # init sample params
     smp_fps = min(MAX_FPS, src_fps)
-    smp_frames = max(1, min(MAX_FRAMES_OS, int(src_frames / src_fps * smp_fps + 0.5)))
+    smp_frames = min(MAX_FRAMES_OS, int(src_frames / src_fps * smp_fps + 0.5))
     smp_fps = smp_frames / max(src_frames / src_fps, 1e-6)
     print(f"v2_sample_video: {src_fps=} -> {smp_fps=}, {src_frames=} -> {smp_frames=}")
     frame_indices = np.linspace(0, src_frames - 1, smp_frames, dtype=int)
@@ -572,16 +534,13 @@ def compute_sad_sum_ratio(x: np.ndarray, anchor, scale, offset) -> float:
     y = np.clip(offset - y, 0, 1)
     return y
 
-def resample_SAD(frames: torch.Tensor, smp_fps: float) -> Tuple[List[int], np.ndarray]:
+def resample_SAD(frames: torch.Tensor, smp_fps: float) -> torch.Tensor:
     """resample video frames based on SAD values.
         Args:
         frames (torch.Tensor): the input video frames, shape (T, C, H, W).
     Returns:
-        Tuple[List[int], np.ndarray]: the resampled video frame indices and SAD values.
+        torch.Tensor: the resampled video frames.
     """
-    if len(frames) <= 1:
-        return list(range(len(frames))), np.array([])
-
     max_sample_interval = max(1, int(MAX_SAMPLE_INTERVAL * smp_fps + 0.5))
 
     # compute SAD values
@@ -637,7 +596,7 @@ def resample_SAD(frames: torch.Tensor, smp_fps: float) -> Tuple[List[int], np.nd
     key_frame_indices = key_frame_indices_new
     print(f"num_key_frames={len(key_frame_indices)}, {key_frame_indices=}, ")
 
-    return key_frame_indices, sad_values
+    return key_frame_indices
 
 ########
 # V2 fetch video
@@ -646,29 +605,20 @@ def v2_fetch_video(
         ele: dict, image_factor: int = IMAGE_FACTOR,
         return_video_sample_fps: bool = False,
         return_video_timestamp: bool = False,
-        return_metadata: bool = False,
-        slice_frames: slice | None = None,
         ) -> torch.Tensor | list[Image.Image]:
     # load video
     video, smp_fps = load_video(ele["video"], sampler=v2_sample_video)
-    if slice_frames is not None:
-        video = video[slice_frames]
-    smp_video = video
 
     # resample frames
     smp_frames = len(video)
     smp_tokens = (video.shape[-3] // image_factor) * (video.shape[-2] // image_factor) * (smp_frames // FRAME_FACTOR)
-    resmp_indices, sad_values = resample_SAD(video, smp_fps)
+    resmp_indices = resample_SAD(video, smp_fps)
     resmp_ts = np.array(resmp_indices) / smp_fps
     video = video[resmp_indices]
-    resmp_video = video
     # duplicate last frame to make it divisible by FRAME_FACTOR
     num_pad_frames = FRAME_FACTOR - (len(video) % FRAME_FACTOR)
     if num_pad_frames < FRAME_FACTOR:
         video = torch.cat([video] + [video[-1:]] * num_pad_frames, dim=0)
-        resmp_ts = np.concatenate(
-            [resmp_ts, np.array([resmp_ts[-1] * num_pad_frames])],
-        )
     resmp_fps = len(video) / smp_frames * smp_fps if smp_frames > 0 else smp_fps
 
     # resize frames
@@ -684,22 +634,9 @@ def v2_fetch_video(
           f"{smp_frames=} -> {resmp_frames=}, ({src_w}, {src_h}) => ({dst_w}, {dst_h})")
     video = batched_resize(video, dst_w, dst_h, method=1, interp='bicubic', channel_first=False)
     video = video.permute(0, 3, 1, 2)
+    print()
 
-    if return_metadata:
-        metadata = {
-            # "smp_fps": smp_fps,
-            # "smp_frames": smp_frames,
-            # "smp_tokens": smp_tokens,
-            # "smp_video": smp_video,
-            # "sad_values": sad_values,
-            # "resmp_indices": resmp_indices,
-            "resmp_ts": resmp_ts,
-            # "resmp_video": resmp_video,
-            "resmp_fps": resmp_fps,
-            # "resmp_frames": resmp_frames,
-            # "resmp_tokens": resmp_tokens,
-        }
-        return video, metadata
+    # return
     if return_video_timestamp:
         return video, resmp_ts
     if return_video_sample_fps:

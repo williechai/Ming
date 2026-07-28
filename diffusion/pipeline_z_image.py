@@ -181,10 +181,16 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
             scheduler=scheduler,
             transformer=transformer,
         )
-        self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
-        )
+
+        if hasattr(self, "vae") and self.vae is not None and 'temperal_downsample' in self.vae.config:
+            self.vae_scale_factor = 2 ** len(self.vae.config.temperal_downsample)
+        else:
+            self.vae_scale_factor = (
+                2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
+            )
+
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.taylor_cache = False
 
     def encode_prompt(
         self,
@@ -341,6 +347,9 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         max_sequence_length: int = 512,
         device: Optional[Union[str, torch.device]] = None,
         ref_hidden_states: Optional[torch.FloatTensor] = None,
+        prompt_embeds_2: Optional[List[torch.FloatTensor]] = None,
+        negative_prompt_embeds_2: Optional[List[torch.FloatTensor]] = None,
+        sample_mode: Optional[str] = "sample",
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -442,33 +451,26 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         self._cfg_normalization = cfg_normalization
         self._cfg_truncation = cfg_truncation
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = len(prompt_embeds)
 
-        # If prompt_embeds is provided and prompt is None, skip encoding
-        if prompt_embeds is not None and prompt is None:
-            if self.do_classifier_free_guidance and negative_prompt_embeds is None:
-                raise ValueError(
-                    "When `prompt_embeds` is provided without `prompt`, "
-                    "`negative_prompt_embeds` must also be provided for classifier-free guidance."
-                )
+        self.vae.config.shift_factor = self.vae.config.shift_factor.to(device=device, dtype=self.vae.dtype) if isinstance(self.vae.config.shift_factor, torch.Tensor) else self.vae.config.shift_factor
+        self.vae.config.scaling_factor = self.vae.config.scaling_factor.to(device=device, dtype=self.vae.dtype) if isinstance(self.vae.config.scaling_factor, torch.Tensor) else self.vae.config.scaling_factor
+
+        assert prompt is None
+        assert prompt_embeds is not None or prompt_embeds_2 is not None
+        if prompt_embeds is not None:
+            batch_size = len(prompt_embeds)
+            if prompt_embeds_2 is not None:
+                assert len(prompt_embeds_2) == len(prompt_embeds)
+
+            assert negative_prompt_embeds is not None
+            assert len(negative_prompt_embeds) == len(prompt_embeds)
         else:
-            (
-                prompt_embeds,
-                negative_prompt_embeds,
-            ) = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                device=device,
-                max_sequence_length=max_sequence_length,
-            )
+            assert prompt_embeds_2 is not None
+            batch_size = len(prompt_embeds_2)
+            assert negative_prompt_embeds_2 is not None
+            assert len(negative_prompt_embeds_2) == len(prompt_embeds_2)
+            
+
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.in_channels
@@ -485,20 +487,43 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         )
 
         if ref_hidden_states is not None:
-            assert ref_hidden_states.ndim == 4 and ref_hidden_states.shape[0] == 1
+            assert ref_hidden_states.ndim == 4  # and ref_hidden_states.shape[0] == 1
             ref_hidden_states = ref_hidden_states.to(self.vae.dtype).to(device)
-            # if torch.distributed.get_rank() == 0:
-            #     embed()
-            # torch.distributed.barrier()
-            ref_hidden_states = self.vae.encode(ref_hidden_states).latent_dist.mode()
-            ref_hidden_states = (ref_hidden_states - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+            C = ref_hidden_states.shape[1]
+            input_channels = self.vae.input_channels
+            if C % input_channels != 0:
+               raise ValueError(f"ref_hidden_states.shape[1] 必须是 {input_channels} 的倍数，但当前 C={C}")
+            num_images = C // input_channels
+            ref_latents = []
+            for i in range(num_images):
+                x = ref_hidden_states[:, i * input_channels:(i + 1) * input_channels, :, :]  # 第 i 张图的 RGB
+                if 'temperal_downsample' in self.vae.config:
+                    x = x.unsqueeze(2)
+                if sample_mode == "argmax":
+                    z = self.vae.encode(x).latent_dist.mode()
+                elif sample_mode == "sample":
+                    z = self.vae.encode(x).latent_dist.sample()
+                z = (z - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+                ref_latents.append(z)
+            
+            ref_hidden_states = torch.cat(ref_latents, dim=1)
+            
+            if ref_hidden_states.dim() == 5:
+                ref_hidden_states = ref_hidden_states.squeeze(2)
+
 
 
         # Repeat prompt_embeds for num_images_per_prompt
         if num_images_per_prompt > 1:
-            prompt_embeds = [pe for pe in prompt_embeds for _ in range(num_images_per_prompt)]
-            if self.do_classifier_free_guidance and negative_prompt_embeds:
-                negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
+            if prompt_embeds is not None:
+                prompt_embeds = [pe for pe in prompt_embeds for _ in range(num_images_per_prompt)]
+                if self.do_classifier_free_guidance and negative_prompt_embeds:
+                    negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
+
+            if prompt_embeds_2 is not None:
+                prompt_embeds_2 = [pe for pe in prompt_embeds_2 for _ in range(num_images_per_prompt)]
+                if self.do_classifier_free_guidance and negative_prompt_embeds_2:
+                    negative_prompt_embeds_2 = [npe for npe in negative_prompt_embeds_2 for _ in range(num_images_per_prompt)]
 
         actual_batch_size = batch_size * num_images_per_prompt
         image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
@@ -551,25 +576,59 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 if apply_cfg:
                     latents_typed = latents.to(self.transformer.dtype)
                     latent_model_input = latents_typed.repeat(2, 1, 1, 1)
-                    prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
+                    prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds if prompt_embeds is not None else None
+                    prompt_embeds_model_input_2 = prompt_embeds_2 + negative_prompt_embeds_2 if prompt_embeds_2 is not None else None
                     timestep_model_input = timestep.repeat(2)
                     ref_hidden_states_input = ref_hidden_states.repeat(2, 1, 1, 1) if ref_hidden_states is not None else None
+                    if ref_hidden_states_input is not None:
+                        ref_hidden_states_input = ref_hidden_states_input.to(latent_model_input.dtype)
                 else:
                     latent_model_input = latents.to(self.transformer.dtype)
                     prompt_embeds_model_input = prompt_embeds
+                    prompt_embeds_model_input_2 = prompt_embeds_2
                     timestep_model_input = timestep
                     ref_hidden_states_input = ref_hidden_states*1.0 if ref_hidden_states is not None else None
+                    if ref_hidden_states_input is not None:
+                        ref_hidden_states_input = ref_hidden_states_input.to(latent_model_input.dtype)
 
                 latent_model_input = latent_model_input.unsqueeze(2)
                 latent_model_input_list = list(latent_model_input.unbind(dim=0))
                 
                 if ref_hidden_states_input is not None:
-                    ref_hidden_states_input = ref_hidden_states_input.unsqueeze(2)
-                    ref_hidden_states_input = list(ref_hidden_states_input.unbind(dim=0))
+                    C = self.vae.config.latent_channels if 'latent_channels' in self.vae.config else self.vae.config.z_dim
 
-                model_out_list = self.transformer(
-                    latent_model_input_list, timestep_model_input, prompt_embeds_model_input, ref_hidden_states=ref_hidden_states_input, return_dict=False
-                )[0]
+                    # 单图输入: [B, C, H, W] -> list of B elems, each [C, 1, H, W]
+                    if ref_hidden_states_input.shape[1] == C:
+                        ref_hidden_states_input = ref_hidden_states_input.unsqueeze(2)              # [B, C, 1, H, W]
+                        ref_hidden_states_input = list(ref_hidden_states_input.unbind(dim=0))       # B * [C, 1, H, W]
+
+                    # 多图输入: [B, N*C, H, W] -> list of B elems, each [C, N, H, W]
+                    else:
+                        B, total_C, H, W = ref_hidden_states_input.shape
+                        if total_C % C != 0:
+                            raise ValueError(
+                                f"ref_hidden_states_input channel ({total_C}) must be divisible by latent_channels ({C})."
+                            )
+                        N = total_C // C
+
+                        # 保序：假设输入按 [img0(C), img1(C), ..., imgN-1(C)] 在channel维拼接
+                        ref_hidden_states_input = (
+                            ref_hidden_states_input.reshape(B, N, C, H, W)         # [B, N, C, H, W]，N顺序与拼接顺序一致
+                                .permute(0, 2, 1, 3, 4)         # [B, C, N, H, W]
+                                .contiguous()
+                        )
+                        ref_hidden_states_input = list(ref_hidden_states_input.unbind(dim=0))        # B * [C, N, H, W]
+
+
+
+                if self.taylor_cache:
+                    model_out_list = self.transformer(
+                        latent_model_input_list, timestep_model_input, prompt_embeds_model_input, ref_hidden_states=ref_hidden_states_input, return_dict=False, encoder_hidden_states_2=prompt_embeds_model_input_2, step=i,
+                    )[0]
+                else:
+                    model_out_list = self.transformer(
+                        latent_model_input_list, timestep_model_input, prompt_embeds_model_input, ref_hidden_states=ref_hidden_states_input, return_dict=False, encoder_hidden_states_2=prompt_embeds_model_input_2,
+                    )[0]
 
                 if apply_cfg:
                     # Perform CFG
@@ -623,9 +682,15 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
 
         else:
             latents = latents.to(self.vae.dtype)
+            if 'temperal_downsample' in self.vae.config:
+                latents = latents.unsqueeze(2)
+
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
+            if image.dim() == 5:
+                image = image.squeeze(2)
+                
             image = self.image_processor.postprocess(image, output_type=output_type)
 
         # Offload all models
@@ -635,3 +700,6 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
             return (image,)
 
         return ZImagePipelineOutput(images=image)
+
+    def set_taylor_cache(self):
+        self.taylor_cache = True
